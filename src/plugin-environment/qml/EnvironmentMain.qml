@@ -6,8 +6,8 @@ DccObject {
         name: "variables"
         parentName: "environment"
         displayName: qsTr("Environment Variables")
-        // 同 Environment.qml：DccObject 阶段无 palette 上下文，使用静态主题图标名。
-        icon: "environment_icon"
+        // 同 Environment.qml：DccObject 阶段无 palette 上下文，使用 freedesktop 标准主题图标名。
+        icon: "preferences-system"
         weight: 10
     }
 }

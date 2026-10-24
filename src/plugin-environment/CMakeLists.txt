@@ -21,10 +21,11 @@ target_link_libraries(${pluginName} PRIVATE
 )
 
 # ---- polkit 提权：写入 /etc/environment ----
-# helper 的绝对安装路径单点定义：Debian 多架构布局下 lib/ 会展开为
-# /usr/lib/x86_64-linux-gnu/，policy 与 C++ 调用点均在此变量下派生，三处永远一致。
+# helper 的绝对安装路径单点定义：按 DDE 惯例提权 helper 放 libexec/（对齐
+# /usr/libexec/<component>/ 既有 polkit helper），policy 与 C++ 调用点均在此变量
+# 下派生，多架构布局下三处永远一致。
 include(GNUInstallDirs)
-set(DDE_ENV_HELPER_INSTALL_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/dde-control-center")
+set(DDE_ENV_HELPER_INSTALL_DIR "${CMAKE_INSTALL_FULL_LIBEXECDIR}/dde-control-center")
 set(DDE_ENV_HELPER_PATH "${DDE_ENV_HELPER_INSTALL_DIR}/dde-env-write")
 
 # HelperPath 供 C++ 侧（envvarstore.cpp）定位 pkexec 目标
@@ -53,14 +54,7 @@ install(CODE "
 ")
 
 # ---- 模块图标 ----
-# DccObject.icon / policy 的 icon_name 均使用 "environment_icon"，
-# 由 QIcon::fromTheme("environment_icon") 解析，因此安装到 hicolor 主题
-# 的 scalable/apps 下（该目录已在 hicolor 的 index.theme 中登记）。
-# 打包（debian/deepin）会在 postinst 调用 gtk-update-icon-cache 刷新主题索引。
-# 提供两个版本：environment_icon（深色/通用，高饱和蓝）与 environment_icon_light
-#（浅色主题，低饱和底色），由 QML 依据主题亮度选择图标名。
-install(FILES
-    "${CMAKE_CURRENT_SOURCE_DIR}/icons/environment_icon.svg"
-    "${CMAKE_CURRENT_SOURCE_DIR}/icons/environment_icon_light.svg"
-    DESTINATION share/icons/hicolor/scalable/apps
-)
+# DccObject.icon 使用 freedesktop 标准主题图标名（preferences-system），由
+# QIcon::fromTheme 在运行时经 deepin-icon-theme 解析，与其它控制中心模块一致；
+# 本插件不携带自带 svg。如需专属图标，应在 deepin-icon-theme 另行收录，
+# 届时只需把 QML 中的图标名改为对应主题名即可。

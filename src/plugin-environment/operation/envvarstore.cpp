@@ -147,9 +147,9 @@ bool EnvVarStore::writeViaPolkit(const QByteArray &content)
     QString tmpPath = tmpFile.fileName();
 
     // helper 绝对路径由 CMake 单点定义（DDE_ENV_HELPER_PATH）传入，与 policy 的
-    // exec.path 注解、install 目标保持同源；未定义时退回到 Debian 多架构安装位。
+    // exec.path 注解、install 目标保持同源；未定义时退回到 DDE libexec 安装位。
 #ifndef DDE_ENV_HELPER_PATH
-#define DDE_ENV_HELPER_PATH "/usr/lib/x86_64-linux-gnu/dde-control-center/dde-env-write"
+#define DDE_ENV_HELPER_PATH "/usr/libexec/dde-control-center/dde-env-write"
 #endif
     static const QString kHelper = QStringLiteral(DDE_ENV_HELPER_PATH);
 

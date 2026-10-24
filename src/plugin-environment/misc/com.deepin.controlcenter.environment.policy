@@ -6,14 +6,14 @@
 
   <vendor>The Deepin Project</vendor>
   <vendor_url>https://www.deepin.org</vendor_url>
-  <icon_name>environment_icon</icon_name>
+  <icon_name>preferences-system</icon_name>
 
   <action id="com.deepin.controlcenter.environment">
     <description>Write system environment variables</description>
     <description xml:lang="zh_CN">写入系统环境变量</description>
     <message>Authentication is required to modify system environment variables (/etc/environment)</message>
     <message xml:lang="zh_CN">修改系统环境变量（/etc/environment）需要进行身份验证</message>
-    <icon_name>environment_icon</icon_name>
+    <icon_name>preferences-system</icon_name>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
@@ -22,8 +22,8 @@
     <!--
       使用 pkexec 调用被授权的 helper 程序向 /etc/environment 写入内容。
       @HELPER_PATH@ 由插件 CMakeLists 在安装阶段替换为 helper 的真实绝对路径
-      （即 ${CMAKE_INSTALL_FULL_LIBDIR}/dde-control-center/dde-env-write，已含
-      Debian 多架构后缀），确保 exec.path 与实际安装位置永远一致。
+      （即 ${CMAKE_INSTALL_FULL_LIBEXECDIR}/dde-control-center/dde-env-write），
+      确保 exec.path 与实际安装位置永远一致。
     -->
     <annotate key="org.freedesktop.policykit.exec.path">@HELPER_PATH@</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
