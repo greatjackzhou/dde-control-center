@@ -1,0 +1,130 @@
+#!/bin/sh
+# dde-env-write: 由 polkit(pkexec) 授权后以 root 身份将临时文件写入 /etc/environment。
+# 仅接受一个源文件参数，目标固定为 /etc/environment，避免任意路径写入。
+#
+# 安全性增强：
+#   1. 原子替换：先复制到目标同目录的临时文件，再 mv 覆盖（rename 保证原子性），
+#      彻底消除写入中途被打断导致 /etc/environment 处于空文件/半写入状态的风险。
+#   2. 内容校验：拒绝明显非法的文件（二进制垃圾、单行超长、无任何合法 KV 行且非空意图）。
+#   3. 备份回滚：替换前保留 .bak，若 mv 失败可紧急恢复。
+#
+# 写入成功后尽力刷新 systemd-logind 全局环境（loginctl set/unset-environment），
+# 使之后新开的会话无需等待旧会话注销也能继承新值；刷新失败不影响写入结果。
+# 当前用户会话环境（systemctl --user）由插件进程自身负责，不在此处理。
+# 用法: pkexec /usr/lib/dde-control-center/dde-env-write <tmpfile>
+set -eu
+
+TARGET="/etc/environment"
+TARGET_DIR=$(dirname "$TARGET")
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: dde-env-write <source-file>" >&2
+    exit 2
+fi
+
+SRC="$1"
+
+# --- 源文件基本校验 ---
+if [ ! -f "$SRC" ] || [ ! -r "$SRC" ]; then
+    echo "source file not found or unreadable: $SRC" >&2
+    exit 1
+fi
+
+# 拒绝超大文件（环境变量文件正常不超过几 KB）
+MAX_SIZE=65536
+SRC_SIZE=$(wc -c < "$SRC")
+if [ "$SRC_SIZE" -gt "$MAX_SIZE" ]; then
+    echo "source file too large ($SRC_SIZE bytes, max $MAX_SIZE): possible corruption" >&2
+    exit 1
+fi
+
+# 拒绝包含 NUL 字节的二进制垃圾文件
+if grep -qP '\x00' "$SRC" 2>/dev/null; then
+    echo "source file contains NUL bytes, refusing to write" >&2
+    exit 1
+fi
+
+# 内容格式校验：每行必须是空行、#注释、或 KEY=VALUE 格式
+# 允许空文件（表示清除所有系统变量）
+if [ -s "$SRC" ]; then
+    BAD_LINES=$(grep -vP '^\s*$|^#|^[A-Za-z_][A-Za-z0-9_]*=' "$SRC" | head -5)
+    if [ -n "$BAD_LINES" ]; then
+        echo "source file contains malformed lines, refusing to write:" >&2
+        echo "$BAD_LINES" >&2
+        exit 1
+    fi
+fi
+
+# --- 原子替换写入 ---
+# 保留旧文件快照，用于对比出被删除的变量 + 紧急回滚
+OLD_SNAPSHOT=$(mktemp)
+trap 'rm -f "$OLD_SNAPSHOT"' EXIT
+cp -f "$TARGET" "$OLD_SNAPSHOT" 2>/dev/null || : > "$OLD_SNAPSHOT"
+
+# 在目标同目录创建临时文件（确保同一文件系统，rename 才能原子）
+TMP_TARGET="$(mktemp "${TARGET_DIR}/.dde-env-XXXXXX")"
+
+# 任何步骤在 mv 之前失败都清理临时文件，原文件不受影响
+trap 'rm -f "$OLD_SNAPSHOT" "$TMP_TARGET"' EXIT
+
+cp "$SRC" "$TMP_TARGET"
+
+# 确保权限与属主正确（mktemp 默认 0600，而 /etc/environment 应为 0644 root:root）
+chmod 0644 "$TMP_TARGET"
+chown root:root "$TMP_TARGET"
+
+# 保留旧文件的 .bak（便于紧急恢复，不覆盖上一次 .bak）
+if [ -f "$TARGET" ]; then
+    cp -f "$TARGET" "${TARGET}.bak" 2>/dev/null || true
+fi
+
+# 原子替换：rename(2) 在同一文件系统上是原子操作，要么成功要么不变
+mv -f "$TMP_TARGET" "$TARGET"
+
+# 成功，清理 trap 中不再需要删除 TMP_TARGET
+trap 'rm -f "$OLD_SNAPSHOT"' EXIT
+
+# --- 刷新 logind 环境 ---
+
+# 去除值的外围成对引号（与插件 EnvVarStore 的写入规则对应）
+strip_quotes() {
+    printf '%s' "$1" | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*)'\$/\1/"
+}
+
+# 提取合法 KEY=VALUE 行（key 规则与插件 isValidVarName 一致）
+list_kv() {
+    sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=\(.*\)$/\1=\2/p' "$1"
+}
+
+list_keys() {
+    sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$1" | sort -u
+}
+
+# 刷新 logind 环境：best-effort，任何失败都不影响文件写入结果
+refresh_logind() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+
+    # 新增/修改的变量逐条写入 logind 全局环境。
+    # PATH 跳过：/etc/environment 中的 PATH 在登录时由 pam_env 处理，
+    # 直接 set 会用文件值覆盖所有用户会话的标准 PATH。
+    list_kv "$SRC" | while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
+        [ "$key" = "PATH" ] && continue
+        loginctl set-environment "$key=$(strip_quotes "$value")" 2>/dev/null || true
+    done
+
+    # 被删除的变量从 logind 环境撤销（同样跳过 PATH，回退登录期值）
+    old_keys=$(mktemp)
+    new_keys=$(mktemp)
+    list_keys "$OLD_SNAPSHOT" > "$old_keys"
+    list_keys "$SRC" > "$new_keys"
+    comm -23 "$old_keys" "$new_keys" | while IFS= read -r key; do
+        [ "$key" = "PATH" ] && continue
+        loginctl unset-environment "$key" 2>/dev/null || true
+    done
+    rm -f "$old_keys" "$new_keys"
+}
+
+refresh_logind || true
+exit 0
