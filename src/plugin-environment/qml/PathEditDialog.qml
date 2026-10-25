@@ -340,17 +340,23 @@ D.DialogWindow {
     }
 
     // 监听 C++ 异步 PATH 保存结果：成功先同步快照再隐藏（避免被关闭守卫拉回），失败就地提示
-    Connections {
-        target: dccData
-        function onOperationResult(success, message) {
-            if (!root.pendingPathSave)
-                return
-            root.pendingPathSave = false
-            if (success) {
-                root.initialSnapshot = root.currentSnapshot()
-                root.hide()
-            } else {
-                saveError.text = qsTr("Save failed, please retry or check permissions")
+    // DialogWindow 的默认属性是 list<Item>，Connections 不是 Item，必须包一层零尺寸 Item
+    Item {
+        width: 0
+        height: 0
+
+        Connections {
+            target: dccData
+            function onOperationResult(success, message) {
+                if (!root.pendingPathSave)
+                    return
+                root.pendingPathSave = false
+                if (success) {
+                    root.initialSnapshot = root.currentSnapshot()
+                    root.hide()
+                } else {
+                    saveError.text = qsTr("Save failed, please retry or check permissions")
+                }
             }
         }
     }
