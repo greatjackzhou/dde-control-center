@@ -70,8 +70,8 @@
         <translation>%1 的用户环境变量</translation>
     </message>
     <message>
-        <source>These variables apply only to your user account (~/.pam_environment)</source>
-        <translation>这些变量仅适用于当前用户账户 (~/.pam_environment)</translation>
+        <source>These variables apply only to your user account (~/.config/environment.d/dde-control-center.conf)</source>
+        <translation type="unfinished">这些变量仅适用于当前用户账户 (~/.config/environment.d/dde-control-center.conf)</translation>
     </message>
     <message>
         <source>System Variables</source>
@@ -82,8 +82,8 @@
         <translation>这些变量适用于所有用户 (/etc/environment)</translation>
     </message>
     <message>
-        <source>Changes are synced automatically without logging out. Newly launched programs take effect immediately; already running programs need to be restarted.</source>
-        <translation>修改会自动同步到运行时环境，无需注销。新启动的程序立即生效，已在运行的程序需重启后生效。</translation>
+        <source>Changes are synced without logging out. For PATH, newly opened terminals take effect right away, but programs that are already running and the graphical session need to be restarted, or you need to log out and back in.</source>
+        <translation>修改会自动同步，无需注销。对于 PATH，新打开的终端会立即生效；但已在运行的程序与图形会话需要重启，或注销并重新登录后才生效。</translation>
     </message>
     <message>
         <source>Delete Variable?</source>

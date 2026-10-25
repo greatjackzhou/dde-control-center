@@ -33,7 +33,7 @@ DccObject {
                     color: D.DTK.palette.windowText
                 }
                 Text {
-                    text: qsTr("These variables apply only to your user account (~/.pam_environment)")
+                    text: qsTr("These variables apply only to your user account (~/.config/environment.d/dde-control-center.conf)")
                     font.pixelSize: D.DTK.fontManager.t8.pixelSize
                     color: D.DTK.palette.windowText
                     opacity: 0.6
@@ -122,10 +122,12 @@ DccObject {
                 }
             }
 
-            // 生效说明：变更后自动同步运行时环境，无需注销
+            // 生效说明：变更后自动同步运行时环境。PATH 除写入 environment.d 外，还在
+            // ~/.profile 与 ~/.bashrc 维护托管块，新开终端无需重登即生效；
+            // 但已运行程序/图形会话无法被注入新环境，需重启或重登
             Text {
                 Layout.fillWidth: true
-                text: qsTr("Changes are synced automatically without logging out. Newly launched programs take effect immediately; already running programs need to be restarted.")
+                text: qsTr("Changes are synced without logging out. For PATH, newly opened terminals take effect right away, but programs that are already running and the graphical session need to be restarted, or you need to log out and back in.")
                 wrapMode: Text.WordWrap
                 font.pixelSize: D.DTK.fontManager.t8.pixelSize
                 color: D.DTK.palette.windowText

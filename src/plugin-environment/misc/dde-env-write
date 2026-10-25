@@ -1,90 +1,89 @@
 #!/bin/sh
-# dde-env-write: 由 polkit(pkexec) 授权后以 root 身份将临时文件写入 /etc/environment。
-# 仅接受一个源文件参数，目标固定为 /etc/environment，避免任意路径写入。
+# dde-env-write: 由 polkit(pkexec) 授权后以 root 身份安装系统级环境配置。
+# 目标路径全部在本脚本内硬编码，调用方只能选择“模式 + 源临时文件”，
+# 永远无法指定任意目标，杜绝任意文件写入。
+#
+# 支持模式：
+#   environment <src>        安装 /etc/environment（兼容旧用法：仅一个参数时即此模式）
+#   profile-d <src>          安装 /etc/profile.d/dde-control-center.sh（系统级 PATH 附加块）
+#   profile-d-remove         删除 /etc/profile.d/dde-control-center.sh
 #
 # 安全性增强：
-#   1. 原子替换：先复制到目标同目录的临时文件，再 mv 覆盖（rename 保证原子性），
-#      彻底消除写入中途被打断导致 /etc/environment 处于空文件/半写入状态的风险。
-#   2. 内容校验：拒绝明显非法的文件（二进制垃圾、单行超长、无任何合法 KV 行且非空意图）。
-#   3. 备份回滚：替换前保留 .bak，若 mv 失败可紧急恢复。
+#   1. 原子替换：先复制到目标同目录的临时文件，再 mv 覆盖（rename 保证原子性）。
+#   2. 内容校验：拒绝超大 / 含 NUL 的文件；environment 每行须为 KV/注释/空行；
+#      profile-d 须携带约定的溯源头标记，防止误覆盖无关文件。
+#   3. 备份回滚：替换前保留 .bak。
 #
-# 写入成功后尽力刷新 systemd-logind 全局环境（loginctl set/unset-environment），
-# 使之后新开的会话无需等待旧会话注销也能继承新值；刷新失败不影响写入结果。
-# 当前用户会话环境（systemctl --user）由插件进程自身负责，不在此处理。
-# 用法: pkexec /usr/lib/dde-control-center/dde-env-write <tmpfile>
+# environment 写入成功后尽力刷新 systemd-logind 全局环境（PATH 除外，见 refresh_logind）。
+# 当前用户会话（systemctl --user）由插件进程自身负责，不在此处理。
+# 用法: pkexec /usr/lib/dde-control-center/dde-env-write <mode> <src>
 set -eu
 
-TARGET="/etc/environment"
-TARGET_DIR=$(dirname "$TARGET")
+ENV_TARGET="/etc/environment"
+PROFILED_TARGET="/etc/profile.d/dde-control-center.sh"
+# profile-d 文件必须包含此标记行才被接受安装（provenance 校验）
+PROFILED_MARKER="# >>> dde-control-center managed PATH profile.d >>>"
+MAX_SIZE=65536
 
-if [ "$#" -ne 1 ]; then
-    echo "usage: dde-env-write <source-file>" >&2
+usage() {
+    echo "usage: dde-env-write [environment <src> | <src> | profile-d <src> | profile-d-remove]" >&2
+}
+
+# --- 模式分派（向后兼容：单个参数 = environment 模式） ---
+if [ "$#" -eq 1 ]; then
+    MODE="environment"
+    SRC="$1"
+elif [ "$#" -eq 2 ]; then
+    MODE="$1"
+    SRC="$2"
+else
+    usage
     exit 2
 fi
 
-SRC="$1"
-
-# --- 源文件基本校验 ---
-if [ ! -f "$SRC" ] || [ ! -r "$SRC" ]; then
-    echo "source file not found or unreadable: $SRC" >&2
-    exit 1
-fi
-
-# 拒绝超大文件（环境变量文件正常不超过几 KB）
-MAX_SIZE=65536
-SRC_SIZE=$(wc -c < "$SRC")
-if [ "$SRC_SIZE" -gt "$MAX_SIZE" ]; then
-    echo "source file too large ($SRC_SIZE bytes, max $MAX_SIZE): possible corruption" >&2
-    exit 1
-fi
-
-# 拒绝包含 NUL 字节的二进制垃圾文件
-if grep -qP '\x00' "$SRC" 2>/dev/null; then
-    echo "source file contains NUL bytes, refusing to write" >&2
-    exit 1
-fi
-
-# 内容格式校验：每行必须是空行、#注释、或 KEY=VALUE 格式
-# 允许空文件（表示清除所有系统变量）
-if [ -s "$SRC" ]; then
-    BAD_LINES=$(grep -vP '^\s*$|^#|^[A-Za-z_][A-Za-z0-9_]*=' "$SRC" | head -5)
-    if [ -n "$BAD_LINES" ]; then
-        echo "source file contains malformed lines, refusing to write:" >&2
-        echo "$BAD_LINES" >&2
+# --- 源文件通用校验 ---
+validate_src() {
+    if [ ! -f "$SRC" ] || [ ! -r "$SRC" ]; then
+        echo "source file not found or unreadable: $SRC" >&2
         exit 1
     fi
-fi
+    SRC_SIZE=$(wc -c < "$SRC")
+    if [ "$SRC_SIZE" -gt "$MAX_SIZE" ]; then
+        echo "source file too large ($SRC_SIZE bytes, max $MAX_SIZE): possible corruption" >&2
+        exit 1
+    fi
+    if grep -qP '\x00' "$SRC" 2>/dev/null; then
+        echo "source file contains NUL bytes, refusing to write" >&2
+        exit 1
+    fi
+}
 
-# --- 原子替换写入 ---
-# 保留旧文件快照，用于对比出被删除的变量 + 紧急回滚
-OLD_SNAPSHOT=$(mktemp)
-trap 'rm -f "$OLD_SNAPSHOT"' EXIT
-cp -f "$TARGET" "$OLD_SNAPSHOT" 2>/dev/null || : > "$OLD_SNAPSHOT"
+# --- 原子安装到固定目标 ---
+# $1 = 源文件, $2 = 目标文件；设置全局 OLD_SNAPSHOT 供后续 diff 使用
+atomic_install() {
+    _src="$1"
+    _target="$2"
+    _tdir=$(dirname "$_target")
 
-# 在目标同目录创建临时文件（确保同一文件系统，rename 才能原子）
-TMP_TARGET="$(mktemp "${TARGET_DIR}/.dde-env-XXXXXX")"
+    OLD_SNAPSHOT=$(mktemp)
+    cp -f "$_target" "$OLD_SNAPSHOT" 2>/dev/null || : > "$OLD_SNAPSHOT"
 
-# 任何步骤在 mv 之前失败都清理临时文件，原文件不受影响
-trap 'rm -f "$OLD_SNAPSHOT" "$TMP_TARGET"' EXIT
+    TMP_TARGET=$(mktemp "${_tdir}/.dde-env-XXXXXX")
+    trap 'rm -f "$OLD_SNAPSHOT" "$TMP_TARGET"' EXIT
 
-cp "$SRC" "$TMP_TARGET"
+    cp "$_src" "$TMP_TARGET"
+    # mktemp 默认 0600，而系统配置应为 0644 root:root
+    chmod 0644 "$TMP_TARGET"
+    chown root:root "$TMP_TARGET"
 
-# 确保权限与属主正确（mktemp 默认 0600，而 /etc/environment 应为 0644 root:root）
-chmod 0644 "$TMP_TARGET"
-chown root:root "$TMP_TARGET"
+    if [ -f "$_target" ]; then
+        cp -f "$_target" "$_target.bak" 2>/dev/null || true
+    fi
 
-# 保留旧文件的 .bak（便于紧急恢复，不覆盖上一次 .bak）
-if [ -f "$TARGET" ]; then
-    cp -f "$TARGET" "${TARGET}.bak" 2>/dev/null || true
-fi
-
-# 原子替换：rename(2) 在同一文件系统上是原子操作，要么成功要么不变
-mv -f "$TMP_TARGET" "$TARGET"
-
-# 成功，清理 trap 中不再需要删除 TMP_TARGET
-trap 'rm -f "$OLD_SNAPSHOT"' EXIT
-
-# --- 刷新 logind 环境 ---
+    mv -f "$TMP_TARGET" "$_target"
+    # 成功后 trap 只需清理快照
+    trap 'rm -f "$OLD_SNAPSHOT"' EXIT
+}
 
 # 去除值的外围成对引号（与插件 EnvVarStore 的写入规则对应）
 strip_quotes() {
@@ -106,7 +105,8 @@ refresh_logind() {
 
     # 新增/修改的变量逐条写入 logind 全局环境。
     # PATH 跳过：/etc/environment 中的 PATH 在登录时由 pam_env 处理，
-    # 直接 set 会用文件值覆盖所有用户会话的标准 PATH。
+    # 直接 set 会用文件值覆盖所有用户会话的标准 PATH；系统 PATH 的生效
+    # 由 /etc/profile.d 附加块负责（profile-d 模式）。
     list_kv "$SRC" | while IFS= read -r line; do
         key=${line%%=*}
         value=${line#*=}
@@ -126,5 +126,40 @@ refresh_logind() {
     rm -f "$old_keys" "$new_keys"
 }
 
-refresh_logind || true
+case "$MODE" in
+    environment)
+        validate_src
+        # 内容格式校验：每行须为空行、#注释或 KEY=VALUE；允许空文件（清空系统变量）
+        if [ -s "$SRC" ]; then
+            BAD_LINES=$(grep -vP '^\s*$|^#|^[A-Za-z_][A-Za-z0-9_]*=' "$SRC" | head -5)
+            if [ -n "$BAD_LINES" ]; then
+                echo "source file contains malformed lines, refusing to write:" >&2
+                echo "$BAD_LINES" >&2
+                exit 1
+            fi
+        fi
+        atomic_install "$SRC" "$ENV_TARGET"
+        refresh_logind || true
+        ;;
+
+    profile-d)
+        validate_src
+        # provenance：仅接受带约定标记行的文件，避免误覆盖无关配置
+        if ! grep -qF "$PROFILED_MARKER" "$SRC"; then
+            echo "profile-d source missing provenance marker, refusing to write" >&2
+            exit 1
+        fi
+        atomic_install "$SRC" "$PROFILED_TARGET"
+        ;;
+
+    profile-d-remove)
+        rm -f "$PROFILED_TARGET"
+        ;;
+
+    *)
+        usage
+        exit 2
+        ;;
+esac
+
 exit 0
