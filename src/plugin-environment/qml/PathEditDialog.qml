@@ -15,6 +15,8 @@ D.DialogWindow {
     property var pathEntries: []
     // 打开时的列表快照：关闭时若内容有差异则提示放弃确认
     property string initialSnapshot: ""
+    // 标记本对话框已发起一次异步 PATH 保存，等待 operationResult 决定关闭或报错
+    property bool pendingPathSave: false
 
     function currentSnapshot() {
         var entries = []
@@ -329,14 +331,26 @@ D.DialogWindow {
                     for (var i = 0; i < pathListModel.count; i++) {
                         entries.push(pathListModel.get(i).path)
                     }
-                    if (dccData.setPathEntries(entries, root.isSystem)) {
-                        // 保存成功后先同步快照再直接隐藏，避免被关闭守卫拉回弹确认
-                        root.initialSnapshot = root.currentSnapshot()
-                        root.hide()
-                    } else {
-                        saveError.text = qsTr("Save failed, please retry or check permissions")
-                    }
+                    // 发起异步保存：结果经 dccData.operationResult 回传，由下方 Connections 处理
+                    root.pendingPathSave = true
+                    dccData.setPathEntries(entries, root.isSystem)
                 }
+            }
+        }
+    }
+
+    // 监听 C++ 异步 PATH 保存结果：成功先同步快照再隐藏（避免被关闭守卫拉回），失败就地提示
+    Connections {
+        target: dccData
+        function onOperationResult(success, message) {
+            if (!root.pendingPathSave)
+                return
+            root.pendingPathSave = false
+            if (success) {
+                root.initialSnapshot = root.currentSnapshot()
+                root.hide()
+            } else {
+                saveError.text = qsTr("Save failed, please retry or check permissions")
             }
         }
     }
@@ -581,10 +595,21 @@ D.DialogWindow {
         }
 
         function doConfirm() {
-            // 去除首尾空白与多余的分隔符
-            var path = pathInput.text.trim().replace(/^:+|:+$/g, "")
+            // Windows 式 PATH 编辑：每行严格一个路径。':' 是 PATH 的段分隔符，
+            // 单个条目内不得出现，否则会与底层 ':' 拼接冲突、重开时被拆成多行。
+            var path = pathInput.text.trim()
             if (path.length === 0) {
                 pathError.text = qsTr("Path cannot be empty")
+                return
+            }
+            if (path.indexOf(':') >= 0) {
+                pathError.text = qsTr("A path entry cannot contain ':'; add one path per line")
+                return
+            }
+            // 存储格式用双引号包裹含空格/冒号的值且无法转义，路径内的 "
+            // 会破坏引号配对，导致读写往返与 pam_env/systemd 解析出错
+            if (path.indexOf('"') >= 0) {
+                pathError.text = qsTr("A path entry cannot contain double quotes (\")")
                 return
             }
             for (var i = 0; i < pathListModel.count; i++) {

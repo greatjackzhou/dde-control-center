@@ -1,10 +1,9 @@
 #include "envvarstore.h"
+#include "envhelper.h"
 
 #include <QFile>
+#include <QSaveFile>
 #include <QTextStream>
-#include <QProcess>
-#include <QTemporaryFile>
-#include <QDir>
 #include <QDebug>
 
 EnvVarStore::EnvVarStore(const QString &filePath, bool needsPolkit, QObject *parent)
@@ -48,55 +47,130 @@ QMap<QString, QString> EnvVarStore::load() const
     return vars;
 }
 
-bool EnvVarStore::save(const QMap<QString, QString> &variables)
+QList<EnvVarStore::Line> EnvVarStore::loadRaw() const
 {
-    return writeToFile(variables);
+    QList<Line> lines;
+    QFile file(m_filePath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return lines;
+    }
+    QTextStream in(&file);
+    while (!in.atEnd()) {
+        const QString raw = in.readLine();
+        const QString t = raw.trimmed();
+        Line l;
+        l.raw = raw;
+        l.isEntry = false;
+        if (!t.isEmpty() && !t.startsWith('#')) {
+            const int eqPos = t.indexOf('=');
+            if (eqPos > 0) {
+                l.key = t.left(eqPos).trimmed();
+                l.isEntry = true;
+            }
+        }
+        lines.append(l);
+    }
+    file.close();
+    return lines;
 }
 
-bool EnvVarStore::addVariable(const QString &key, const QString &value)
+QString EnvVarStore::formatEntryLine(const QString &key, const QString &value)
 {
-    QMap<QString, QString> vars = load();
-    if (vars.contains(key)) {
-        return false; // 已存在
+    QString v = value;
+    if (v.contains(' ') || v.contains(':') || v.contains(';')) {
+        v = '"' + v + '"';
     }
-    vars[key] = value;
-    bool ok = save(vars);
-    if (ok) {
-        Q_EMIT variablesChanged();
-    }
-    return ok;
+    return key + QLatin1Char('=') + v;
 }
 
-bool EnvVarStore::editVariable(const QString &oldKey, const QString &key, const QString &value)
+QByteArray EnvVarStore::joinLines(const QList<Line> &lines)
 {
-    QMap<QString, QString> vars = load();
-    if (!vars.contains(oldKey)) {
-        return false;
+    QByteArray content;
+    for (const Line &l : lines) {
+        content += l.raw.toUtf8();
+        content += '\n';
     }
-    // 如果改了 key 名称，需要删除旧 key
+    return content;
+}
+
+void EnvVarStore::addVariableAsync(const QString &key, const QString &value,
+                                   std::function<void(bool)> onDone)
+{
+    QList<Line> lines = loadRaw();
+    for (const Line &l : lines) {
+        if (l.isEntry && l.key == key) {
+            if (onDone) onDone(false); // 已存在
+            return;
+        }
+    }
+    Line nl;
+    nl.key = key;
+    nl.isEntry = true;
+    nl.raw = formatEntryLine(key, value);
+    lines.append(nl);
+    writeContentAsync(joinLines(lines), [this, onDone](bool ok) {
+        if (ok) {
+            Q_EMIT variablesChanged();
+        }
+        if (onDone) onDone(ok);
+    });
+}
+
+void EnvVarStore::editVariableAsync(const QString &oldKey, const QString &key,
+                                    const QString &value, std::function<void(bool)> onDone)
+{
+    QList<Line> lines = loadRaw();
+    int idx = -1;
+    for (int i = 0; i < lines.size(); ++i) {
+        if (lines[i].isEntry && lines[i].key == oldKey) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        if (onDone) onDone(false); // 原键不存在
+        return;
+    }
+    // 改名时避免与既有键冲突（生成重复键）
     if (oldKey != key) {
-        vars.remove(oldKey);
+        for (int i = 0; i < lines.size(); ++i) {
+            if (i != idx && lines[i].isEntry && lines[i].key == key) {
+                if (onDone) onDone(false);
+                return;
+            }
+        }
     }
-    vars[key] = value;
-    bool ok = save(vars);
-    if (ok) {
-        Q_EMIT variablesChanged();
-    }
-    return ok;
+    lines[idx].raw = formatEntryLine(key, value);
+    lines[idx].key = key;
+    writeContentAsync(joinLines(lines), [this, onDone](bool ok) {
+        if (ok) {
+            Q_EMIT variablesChanged();
+        }
+        if (onDone) onDone(ok);
+    });
 }
 
-bool EnvVarStore::removeVariable(const QString &key)
+void EnvVarStore::removeVariableAsync(const QString &key, std::function<void(bool)> onDone)
 {
-    QMap<QString, QString> vars = load();
-    if (!vars.contains(key)) {
-        return false;
+    QList<Line> lines = loadRaw();
+    int idx = -1;
+    for (int i = 0; i < lines.size(); ++i) {
+        if (lines[i].isEntry && lines[i].key == key) {
+            idx = i;
+            break;
+        }
     }
-    vars.remove(key);
-    bool ok = save(vars);
-    if (ok) {
-        Q_EMIT variablesChanged();
+    if (idx < 0) {
+        if (onDone) onDone(false); // 不存在
+        return;
     }
-    return ok;
+    lines.removeAt(idx);
+    writeContentAsync(joinLines(lines), [this, onDone](bool ok) {
+        if (ok) {
+            Q_EMIT variablesChanged();
+        }
+        if (onDone) onDone(ok);
+    });
 }
 
 bool EnvVarStore::contains(const QString &key) const
@@ -109,93 +183,26 @@ QString EnvVarStore::value(const QString &key) const
     return load().value(key);
 }
 
-bool EnvVarStore::writeToFile(const QMap<QString, QString> &variables)
+void EnvVarStore::writeContentAsync(const QByteArray &content, std::function<void(bool)> onDone)
 {
-    QByteArray content;
-    QTextStream out(&content);
-    for (auto it = variables.constBegin(); it != variables.constEnd(); ++it) {
-        QString value = it.value();
-        if (value.contains(' ') || value.contains(':') || value.contains(';')) {
-            value = '"' + value + '"';
-        }
-        out << it.key() << "=" << value << "\n";
-    }
-    out.flush();
-
     if (m_needsPolkit) {
-        return writeViaPolkit(content);
-    } else {
-        return writeDirect(content);
-    }
-}
-
-bool EnvVarStore::writeViaPolkit(const QByteArray &content)
-{
-    // 写入临时文件，再经 polkit 授权的 helper 复制到目标位置。
-    // helper 由 com.deepin.controlcenter.environment 动作授权（见 misc/*.policy），
-    // 目标固定为 /etc/environment，故此处无需再传目标路径。
-    QTemporaryFile tmpFile(QDir::tempPath() + "/dde-env-XXXXXX");
-    tmpFile.setAutoRemove(false);
-    if (!tmpFile.open()) {
-        qWarning() << "Failed to create temp file:" << tmpFile.errorString();
-        return false;
-    }
-    tmpFile.write(content);
-    // 必须 flush 到磁盘，root 侧的 helper 进程才能读到完整内容
-    tmpFile.flush();
-    tmpFile.close();
-    QString tmpPath = tmpFile.fileName();
-
-    // helper 绝对路径由 CMake 单点定义（DDE_ENV_HELPER_PATH）传入，与 policy 的
-    // exec.path 注解、install 目标保持同源；未定义时退回到 DDE libexec 安装位。
-#ifndef DDE_ENV_HELPER_PATH
-#define DDE_ENV_HELPER_PATH "/usr/libexec/dde-control-center/dde-env-write"
-#endif
-    static const QString kHelper = QStringLiteral(DDE_ENV_HELPER_PATH);
-
-    QProcess process;
-    process.start("pkexec", {kHelper, tmpPath});
-    if (!process.waitForStarted(30000)) {
-        qWarning() << "pkexec failed to start (helper missing or polkit unavailable?)";
-        QFile::remove(tmpPath);
-        return false;
-    }
-    if (!process.waitForFinished(30000)) {
-        qWarning() << "pkexec timed out";
-        process.kill();
-        process.waitForFinished(1000);
-        QFile::remove(tmpPath);
-        return false;
+        // 系统级：经 polkit helper 原子安装到 /etc/environment（environment 模式）
+        DdeEnvHelper::runWithContentAsync(content, {QStringLiteral("environment")},
+                                          std::move(onDone));
+        return;
     }
 
-    QFile::remove(tmpPath);
-
-    // pkexec 约定：126 = 用户取消/未授权；127 = helper 无法执行；
-    // 其余非 0 为 helper 自身返回码。0 表示写入成功。
-    const int exitCode = process.exitCode();
-    if (exitCode != 0) {
-        const QString err = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-        if (exitCode == 126) {
-            qWarning() << "polkit authorization cancelled or denied (code 126)";
-        } else if (exitCode == 127) {
-            qWarning() << "helper not executable (code 127):" << kHelper;
-        } else {
-            qWarning() << "dde-env-write helper failed (code" << exitCode << "):"
-                       << err;
-        }
-        return false;
-    }
-    return true;
-}
-
-bool EnvVarStore::writeDirect(const QByteArray &content)
-{
-    QFile file(m_filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    // 用户级：QSaveFile 原子替换，避免中途失败清空原文件
+    QSaveFile file(m_filePath);
+    if (!file.open(QIODevice::WriteOnly)) {
         qWarning() << "Failed to open file for writing:" << m_filePath << file.errorString();
-        return false;
+        if (onDone) onDone(false);
+        return;
     }
     file.write(content);
-    file.close();
-    return true;
+    const bool ok = file.commit();
+    if (!ok) {
+        qWarning() << "Failed to commit" << m_filePath << file.errorString();
+    }
+    if (onDone) onDone(ok);
 }

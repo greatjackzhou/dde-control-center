@@ -1,11 +1,12 @@
 #include "environmentmodule.h"
 #include "envvarstore.h"
 #include "envvarmodel.h"
+#include "envhelper.h"
 
 #include <QDir>
 #include <QFile>
 #include <QProcess>
-#include <QTemporaryFile>
+#include <QSaveFile>
 #include <QDebug>
 #include <pwd.h>
 #include <unistd.h>
@@ -13,6 +14,9 @@
 #include <QSet>
 
 #include "dccfactory.h"
+
+// /etc/profile.d 托管脚本的目标绝对路径（与 helper 内硬编码一致）。
+static const QString kProfileDTarget = QStringLiteral("/etc/profile.d/dde-control-center.sh");
 
 // 用户级 PATH 采用非破坏性存储：持久化值尾部带一个 "$PATH" 哨兵段，
 // 表示"保留登录期标准路径"。读回展示给编辑器前需把哨兵剥离，
@@ -56,13 +60,6 @@ static QStringList stripStandardBase(const QString &raw)
     return out;
 }
 
-// 提权 helper 绝对路径：由 CMake 以 DDE_ENV_HELPER_PATH 宏单点传入，与 policy
-// 的 exec.path 注解、install 目标同源；未定义时退回 DDE libexec 安装位。
-#ifndef DDE_ENV_HELPER_PATH
-#define DDE_ENV_HELPER_PATH "/usr/libexec/dde-control-center/dde-env-write"
-#endif
-static const QString kEnvHelper = QStringLiteral(DDE_ENV_HELPER_PATH);
-
 // 单引号安全包裹一个目录：生成脚本中以字面量使用，不会触发命令替换。
 static QString shellSingleQuote(const QString &s)
 {
@@ -102,60 +99,17 @@ static QString buildProfileDContent(const QStringList &dirs)
                "# <<< dde-control-center managed PATH profile.d <<<\n");
 }
 
-// 统一调用 pkexec helper 并按退出码判定（126=取消/未授权；127=helper 不可执行）。
-static bool runEnvHelper(const QStringList &argsAfterHelper)
+// 异步经 pkexec helper 把 profile-d 内容安装到 /etc/profile.d/dde-control-center.sh。
+static void installProfileDAsync(const QString &content, std::function<void(bool)> onDone)
 {
-    QProcess process;
-    QStringList args;
-    args << kEnvHelper << argsAfterHelper;
-    process.start(QStringLiteral("pkexec"), args);
-    if (!process.waitForStarted(30000)) {
-        qWarning() << "pkexec failed to start env helper";
-        return false;
-    }
-    if (!process.waitForFinished(30000)) {
-        qWarning() << "pkexec env helper timed out";
-        process.kill();
-        process.waitForFinished(1000);
-        return false;
-    }
-    const int code = process.exitCode();
-    if (code != 0) {
-        const QString err = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-        if (code == 126)
-            qWarning() << "polkit authorization cancelled or denied (code 126)";
-        else if (code == 127)
-            qWarning() << "env helper not executable (code 127):" << kEnvHelper;
-        else
-            qWarning() << "env helper failed (code" << code << "):" << err;
-        return false;
-    }
-    return true;
+    DdeEnvHelper::runWithContentAsync(content.toUtf8(), {QStringLiteral("profile-d")},
+                                      std::move(onDone));
 }
 
-// 将内容经临时文件 + pkexec 安装到 /etc/profile.d/dde-control-center.sh。
-static bool installProfileD(const QString &content)
+// 异步删除 /etc/profile.d/dde-control-center.sh（不存在时 helper rm -f 也返回 0）。
+static void removeProfileDAsync(std::function<void(bool)> onDone)
 {
-    QTemporaryFile tmpFile(QDir::tempPath() + QStringLiteral("/dde-env-XXXXXX"));
-    tmpFile.setAutoRemove(false);
-    if (!tmpFile.open()) {
-        qWarning() << "Failed to create temp file:" << tmpFile.errorString();
-        return false;
-    }
-    tmpFile.write(content.toUtf8());
-    tmpFile.flush();
-    tmpFile.close();
-    const QString tmpPath = tmpFile.fileName();
-
-    const bool ok = runEnvHelper({QStringLiteral("profile-d"), tmpPath});
-    QFile::remove(tmpPath);
-    return ok;
-}
-
-// 删除 /etc/profile.d/dde-control-center.sh（不存在时 helper rm -f 也返回 0）。
-static bool removeProfileD()
-{
-    return runEnvHelper({QStringLiteral("profile-d-remove")});
+    DdeEnvHelper::runAsync({QStringLiteral("profile-d-remove")}, std::move(onDone));
 }
 
 EnvironmentModule::EnvironmentModule(QObject *parent)
@@ -224,28 +178,48 @@ void EnvironmentModule::setSaving(bool saving)
     }
 }
 
-bool EnvironmentModule::addUserVar(const QString &key, const QString &value)
+// 统一收尾：清除 saving 并回传结果给 QML。
+void EnvironmentModule::finishOperation(bool ok, const QString &message)
 {
-    setSaving(true);
-    bool ok = m_userStore->addVariable(key, value);
     setSaving(false);
-    if (ok) {
+    Q_EMIT operationResult(ok, message);
+}
+
+void EnvironmentModule::addUserVar(const QString &key, const QString &value)
+{
+    if (m_saving) return;
+    if (!isValidVarName(key)) {
+        finishOperation(false, tr("Invalid variable name"));
+        return;
+    }
+    setSaving(true);
+    m_userStore->addVariableAsync(key, value, [this, key, value](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to add: variable already exists"));
+            return;
+        }
         applyRuntimeVar(key, value);
         reloadUserEnvironment();
         if (key == QLatin1String("PATH")) {
             syncUserPathToProfile();
         }
-    }
-    Q_EMIT operationResult(ok, ok ? tr("Added successfully") : tr("Failed to add: variable already exists"));
-    return ok;
+        finishOperation(true, tr("Added successfully"));
+    });
 }
 
-bool EnvironmentModule::editUserVar(const QString &oldKey, const QString &key, const QString &value)
+void EnvironmentModule::editUserVar(const QString &oldKey, const QString &key, const QString &value)
 {
+    if (m_saving) return;
+    if (!isValidVarName(key)) {
+        finishOperation(false, tr("Invalid variable name"));
+        return;
+    }
     setSaving(true);
-    bool ok = m_userStore->editVariable(oldKey, key, value);
-    setSaving(false);
-    if (ok) {
+    m_userStore->editVariableAsync(oldKey, key, value, [this, oldKey, key, value](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to modify"));
+            return;
+        }
         if (oldKey != key) {
             revokeRuntimeVar(oldKey);
         }
@@ -254,74 +228,98 @@ bool EnvironmentModule::editUserVar(const QString &oldKey, const QString &key, c
         if (key == QLatin1String("PATH") || oldKey == QLatin1String("PATH")) {
             syncUserPathToProfile();
         }
-    }
-    Q_EMIT operationResult(ok, ok ? tr("Modified successfully") : tr("Failed to modify"));
-    return ok;
+        finishOperation(true, tr("Modified successfully"));
+    });
 }
 
-bool EnvironmentModule::removeUserVar(const QString &key)
+void EnvironmentModule::removeUserVar(const QString &key)
 {
+    if (m_saving) return;
     setSaving(true);
-    bool ok = m_userStore->removeVariable(key);
-    setSaving(false);
-    if (ok) {
+    m_userStore->removeVariableAsync(key, [this, key](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to delete"));
+            return;
+        }
         revokeRuntimeVar(key);
         reloadUserEnvironment();
         if (key == QLatin1String("PATH")) {
             syncUserPathToProfile();
         }
-    }
-    Q_EMIT operationResult(ok, ok ? tr("Deleted successfully") : tr("Failed to delete"));
-    return ok;
+        finishOperation(true, tr("Deleted successfully"));
+    });
 }
 
-bool EnvironmentModule::addSystemVar(const QString &key, const QString &value)
+void EnvironmentModule::addSystemVar(const QString &key, const QString &value)
 {
+    if (m_saving) return;
+    if (!isValidVarName(key)) {
+        finishOperation(false, tr("Invalid variable name"));
+        return;
+    }
     setSaving(true);
-    bool ok = m_systemStore->addVariable(key, value);
-    setSaving(false);
-    if (ok) {
+    m_systemStore->addVariableAsync(key, value, [this, key, value](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to add: variable already exists or permission denied"));
+            return;
+        }
         // logind 全局环境已由 helper 刷新，这里同步当前用户会话环境
         applyRuntimeVar(key, value);
         if (key == QLatin1String("PATH")) {
-            syncSystemPathToProfileD();
+            syncSystemPathToProfileDAsync([this](bool) {
+                finishOperation(true, tr("Added successfully"));
+            });
+        } else {
+            finishOperation(true, tr("Added successfully"));
         }
-    }
-    Q_EMIT operationResult(ok, ok ? tr("Added successfully") : tr("Failed to add: variable already exists or permission denied"));
-    return ok;
+    });
 }
 
-bool EnvironmentModule::editSystemVar(const QString &oldKey, const QString &key, const QString &value)
+void EnvironmentModule::editSystemVar(const QString &oldKey, const QString &key, const QString &value)
 {
+    if (m_saving) return;
+    if (!isValidVarName(key)) {
+        finishOperation(false, tr("Invalid variable name"));
+        return;
+    }
     setSaving(true);
-    bool ok = m_systemStore->editVariable(oldKey, key, value);
-    setSaving(false);
-    if (ok) {
+    m_systemStore->editVariableAsync(oldKey, key, value, [this, oldKey, key, value](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to modify or permission denied"));
+            return;
+        }
         if (oldKey != key) {
             revokeRuntimeVar(oldKey);
         }
         applyRuntimeVar(key, value);
         if (key == QLatin1String("PATH") || oldKey == QLatin1String("PATH")) {
-            syncSystemPathToProfileD();
+            syncSystemPathToProfileDAsync([this](bool) {
+                finishOperation(true, tr("Modified successfully"));
+            });
+        } else {
+            finishOperation(true, tr("Modified successfully"));
         }
-    }
-    Q_EMIT operationResult(ok, ok ? tr("Modified successfully") : tr("Failed to modify or permission denied"));
-    return ok;
+    });
 }
 
-bool EnvironmentModule::removeSystemVar(const QString &key)
+void EnvironmentModule::removeSystemVar(const QString &key)
 {
+    if (m_saving) return;
     setSaving(true);
-    bool ok = m_systemStore->removeVariable(key);
-    setSaving(false);
-    if (ok) {
+    m_systemStore->removeVariableAsync(key, [this, key](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to delete or permission denied"));
+            return;
+        }
         revokeRuntimeVar(key);
         if (key == QLatin1String("PATH")) {
-            syncSystemPathToProfileD();
+            syncSystemPathToProfileDAsync([this](bool) {
+                finishOperation(true, tr("Deleted successfully"));
+            });
+        } else {
+            finishOperation(true, tr("Deleted successfully"));
         }
-    }
-    Q_EMIT operationResult(ok, ok ? tr("Deleted successfully") : tr("Failed to delete or permission denied"));
-    return ok;
+    });
 }
 
 QStringList EnvironmentModule::getPathEntries(bool isSystem)
@@ -339,11 +337,14 @@ QStringList EnvironmentModule::getPathEntries(bool isSystem)
     return stripStandardBase(pathValue);
 }
 
-bool EnvironmentModule::setPathEntries(const QStringList &entries, bool isSystem)
+void EnvironmentModule::setPathEntries(const QStringList &entries, bool isSystem)
 {
+    if (m_saving) return;
     EnvVarStore *store = isSystem ? m_systemStore : m_userStore;
 
-    // 过滤掉空段与用户可能误粘的 $PATH 哨兵，得到具体目录列表
+    // 过滤掉空段、用户可能误粘的 $PATH 哨兵，并拒绝含换行的目录（无法安全
+    // 嵌入持久化文件与托管块），得到具体目录列表；同名目录仅保留首次出现，
+    // 避免重复条目被原样拼接进持久化值与托管脚本。
     QStringList concrete;
     for (const QString &entry : entries) {
         if (entry.isEmpty()
@@ -351,47 +352,64 @@ bool EnvironmentModule::setPathEntries(const QStringList &entries, bool isSystem
             || entry == QLatin1String("${PATH}")) {
             continue;
         }
-        concrete.append(entry);
+        if (entry.contains(QLatin1Char('\n')) || entry.contains(QLatin1Char('\r'))) {
+            continue;
+        }
+        if (!concrete.contains(entry)) {
+            concrete.append(entry);
+        }
     }
 
     setSaving(true);
-    bool ok;
-    if (concrete.isEmpty()) {
-        // 清空 PATH：删除该变量（仅当存在时），交由登录期 profile 决定最终值
-        ok = store->contains("PATH") ? store->removeVariable("PATH") : true;
-    } else {
-        // 系统级：写入 "自定义目录:标准基准"，使直读 pam_env 的 GUI 会话既
-        // 不丢 /usr/bin 等系统目录，又能拿到自定义目录（编辑器展示时剥离基准）
-        // 用户级：追加 :$PATH 哨兵做非破坏性写入，重登后 systemd 服务仍保留标准路径
-        QString newPath = isSystem
-            ? concrete.join(QLatin1Char(':')) + QLatin1Char(':') + standardPathBaseDirs().join(QLatin1Char(':'))
-            : concrete.join(QLatin1Char(':')) + QStringLiteral(":$PATH");
-        if (store->contains("PATH")) {
-            ok = store->editVariable("PATH", "PATH", newPath);
-        } else {
-            ok = store->addVariable("PATH", newPath);
+
+    // 存储写入成功后的统一后续：运行时同步 + 生效通道投递。
+    auto afterWrite = [this, isSystem, concrete](bool ok) {
+        if (!ok) {
+            finishOperation(false, tr("Failed to update PATH"));
+            return;
         }
-    }
-    setSaving(false);
-    if (ok) {
         if (!isSystem) {
             // 用户级：先同步运行时（当前进程 + systemd 用户环境），再刷新
-            // generator，并把自定义目录落到 ~/.profile 托管块供终端/桌面继承
+            // generator，并把自定义目录落到 ~/.profile/~/.bashrc 托管块供终端继承
             if (!concrete.isEmpty()) {
                 applyRuntimeVar(QStringLiteral("PATH"), concrete.join(':'));
             }
             reloadUserEnvironment();
             syncUserPathToProfile();
+            finishOperation(true, tr("PATH updated"));
         } else {
             if (!concrete.isEmpty()) {
                 applyRuntimeVar(QStringLiteral("PATH"), concrete.join(':'));
             }
-            // 系统级：同步维护 /etc/profile.d 追加脚本（dirs 为空时删除）
-            syncSystemPathToProfileD();
+            // 系统级：同步维护 /etc/profile.d 追加脚本（dirs 为空时删除），
+            // profile-d 为 best-effort，最终以 /etc/environment 写入结果定性。
+            syncSystemPathToProfileDAsync([this](bool) {
+                finishOperation(true, tr("PATH updated"));
+            });
         }
+    };
+
+    if (concrete.isEmpty()) {
+        // 清空 PATH：删除该变量（仅当存在时），交由登录期 profile 决定最终值
+        if (store->contains("PATH")) {
+            store->removeVariableAsync(QStringLiteral("PATH"), afterWrite);
+        } else {
+            afterWrite(true);
+        }
+        return;
     }
-    Q_EMIT operationResult(ok, ok ? tr("PATH updated") : tr("Failed to update PATH"));
-    return ok;
+
+    // 系统级：写入 "自定义目录:标准基准"，使直读 pam_env 的 GUI 会话既
+    // 不丢 /usr/bin 等系统目录，又能拿到自定义目录（编辑器展示时剥离基准）
+    // 用户级：追加 :$PATH 哨兵做非破坏性写入，重登后 systemd 服务仍保留标准路径
+    QString newPath = isSystem
+        ? concrete.join(QLatin1Char(':')) + QLatin1Char(':') + standardPathBaseDirs().join(QLatin1Char(':'))
+        : concrete.join(QLatin1Char(':')) + QStringLiteral(":$PATH");
+    if (store->contains("PATH")) {
+        store->editVariableAsync(QStringLiteral("PATH"), QStringLiteral("PATH"), newPath, afterWrite);
+    } else {
+        store->addVariableAsync(QStringLiteral("PATH"), newPath, afterWrite);
+    }
 }
 
 // 将变量写入运行时环境：
@@ -451,18 +469,12 @@ bool EnvironmentModule::isValidVarName(const QString &name)
 // systemd-user-environment-generator 在用户管理器启动时解析。
 // 仅靠 set-environment 同步当前会话不够：不刷新 generator，
 // 下次登录会话仍会读到旧的环境快照。daemon-reload 会重新执行
-// generator 并刷新用户管理器的环境缓存。best-effort，失败仅记日志。
+// generator 并刷新用户管理器的环境缓存。best-effort，非阻塞，失败仅记日志。
 void EnvironmentModule::reloadUserEnvironment()
 {
-    QProcess process;
-    process.start("systemctl", {QStringLiteral("--user"), QStringLiteral("daemon-reload")});
-    if (!process.waitForFinished(10000)) {
+    if (!QProcess::startDetached("systemctl",
+            {QStringLiteral("--user"), QStringLiteral("daemon-reload")})) {
         qWarning() << "Failed to reload systemd user environment generator";
-        process.kill();
-        process.waitForFinished(1000);
-    } else if (process.exitCode() != 0) {
-        qWarning() << "systemctl --user daemon-reload failed:"
-                   << QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
     }
 }
 
@@ -483,6 +495,7 @@ void EnvironmentModule::syncUserPathToProfile()
 
 // 向单个 shell 启动文件写入或清除带守卫的 PATH 托管块。重写时只替换
 // 标记之间内容，不触碰用户其余配置；文件不存在且无内容可写时不创建。
+// 采用 QSaveFile 原子替换，避免 truncate 与写入之间的崩溃/断电清空用户配置。
 void EnvironmentModule::writePathBlockToFile(const QString &filePath, const QStringList &dirs)
 {
     static const QString kBegin = QStringLiteral("# >>> dde-control-center managed PATH >>>");
@@ -524,86 +537,95 @@ void EnvironmentModule::writePathBlockToFile(const QString &filePath, const QStr
         stripped.chop(1);
     }
 
-    // 无自定义目录：若原本就没有文件，则无需创建也不需剔除；
-    // 否则写回已剔除块的内容。
+    // 组装最终内容
+    QString out;
     if (dirs.isEmpty()) {
+        // 无自定义目录：若原本就没有文件，则无需创建也不需剔除；否则写回已剔除块的内容。
         if (!existed) {
             return;
         }
-        QFile wf(filePath);
-        if (!wf.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            qWarning() << "Failed to write" << filePath << wf.errorString();
-            return;
+        out = stripped;
+    } else {
+        // 追加新的托管块：守卫确保同一会话链只应用一次；目录逐个以单引号字面量
+        // 注入（不触发命令替换），去重后前插到基准 PATH，非破坏性。
+        QStringList quotedDirs;
+        for (const QString &d : dirs) {
+            if (d.contains(QLatin1Char('\n')) || d.contains(QLatin1Char('\r'))) {
+                continue;
+            }
+            quotedDirs << shellSingleQuote(d);
         }
-        wf.write(stripped.toUtf8());
-        wf.close();
-        return;
-    }
 
-    // 追加新的托管块：守卫确保同一会话链只应用一次；目录逐个以单引号字面量
-    // 注入（不触发命令替换），去重后前插到基准 PATH，非破坏性。
-    QStringList quotedDirs;
-    for (const QString &d : dirs) {
-        if (d.contains(QLatin1Char('\n')) || d.contains(QLatin1Char('\r'))) {
-            continue;
+        out = stripped;
+        if (!out.isEmpty() && !out.endsWith('\n')) {
+            out += '\n';
         }
-        quotedDirs << shellSingleQuote(d);
+        QString pathApply;
+        if (!quotedDirs.isEmpty()) {
+            pathApply =
+                QStringLiteral("    for d in ") + quotedDirs.join(QLatin1Char(' '))
+                + QStringLiteral(" ; do\n")
+                + QStringLiteral("        case \":${PATH}:\" in\n")
+                + QStringLiteral("            *\":${d}:\"*) ;;\n")
+                + QStringLiteral("            *) PATH=\"${d}:${PATH}\" ;;\n")
+                + QStringLiteral("        esac\n")
+                + QStringLiteral("    done\n")
+                + QStringLiteral("    export PATH\n");
+        }
+        const QString block =
+            QStringLiteral("\n") + kBegin + QStringLiteral("\n")
+            + QStringLiteral("# 由 DDE 控制中心自动维护，请在“环境变量”页面中编辑；\n")
+            + QStringLiteral("# 手动修改本块内容会在下次保存时被覆盖。\n")
+            + QStringLiteral("if [ -z \"$DDE_ENV_PATH_APPLIED\" ]; then\n")
+            + QStringLiteral("    export DDE_ENV_PATH_APPLIED=1\n")
+            + pathApply
+            + QStringLiteral("fi\n")
+            + kEnd + QStringLiteral("\n");
+        out += block;
     }
 
-    QString out = stripped;
-    if (!out.isEmpty() && !out.endsWith('\n')) {
-        out += '\n';
-    }
-    QString pathApply;
-    if (!quotedDirs.isEmpty()) {
-        pathApply =
-            QStringLiteral("    for d in ") + quotedDirs.join(QLatin1Char(' '))
-            + QStringLiteral(" ; do\n")
-            + QStringLiteral("        case \":${PATH}:\" in\n")
-            + QStringLiteral("            *\":${d}:\"*) ;;\n")
-            + QStringLiteral("            *) PATH=\"${d}:${PATH}\" ;;\n")
-            + QStringLiteral("        esac\n")
-            + QStringLiteral("    done\n")
-            + QStringLiteral("    export PATH\n");
-    }
-    const QString block =
-        QStringLiteral("\n") + kBegin + QStringLiteral("\n")
-        + QStringLiteral("# 由 DDE 控制中心自动维护，请在“环境变量”页面中编辑；\n")
-        + QStringLiteral("# 手动修改本块内容会在下次保存时被覆盖。\n")
-        + QStringLiteral("if [ -z \"$DDE_ENV_PATH_APPLIED\" ]; then\n")
-        + QStringLiteral("    export DDE_ENV_PATH_APPLIED=1\n")
-        + pathApply
-        + QStringLiteral("fi\n")
-        + kEnd + QStringLiteral("\n");
-    out += block;
-
-    QFile wf(filePath);
-    if (!wf.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+    // 原子写：QSaveFile 先写临时文件，commit() 成功才 rename 覆盖目标。
+    QSaveFile wf(filePath);
+    if (!wf.open(QIODevice::WriteOnly | QIODevice::Text)) {
         qWarning() << "Failed to write" << filePath << wf.errorString();
         return;
     }
     wf.write(out.toUtf8());
-    wf.close();
+    if (!wf.commit()) {
+        qWarning() << "Failed to commit" << filePath << wf.errorString();
+    }
 }
 
-// 根据系统级 PATH 安装/删除 /etc/profile.d/dde-control-center.sh（经 polkit 提权）。
+// 根据系统级 PATH 异步安装/删除 /etc/profile.d/dde-control-center.sh（经 polkit 提权）。
 // /etc/environment 仍作为系统变量列表的存储源（供 UI 展示与回读），但它的 PATH
 // 会被 login.defs 与 /etc/profile 覆盖，对登录 shell 无效；真正的生效靠本脚本。
-void EnvironmentModule::syncSystemPathToProfileD()
+// dirs 为空时删除脚本；脚本本就不存在则跳过删除以免多余授权。best-effort。
+void EnvironmentModule::syncSystemPathToProfileDAsync(std::function<void(bool)> onDone)
 {
     // 取自定义目录（剥离尾部标准基准）；为空则删除脚本。
     const QStringList dirs = stripStandardBase(m_systemStore->value(QStringLiteral("PATH")));
+    const bool scriptExists = QFile::exists(kProfileDTarget);
+
     if (dirs.isEmpty()) {
-        removeProfileD();
+        if (scriptExists) {
+            removeProfileDAsync(std::move(onDone));
+        } else if (onDone) {
+            onDone(true);
+        }
         return;
     }
+
     const QString content = buildProfileDContent(dirs);
     if (content.isEmpty()) {
-        // 无可安全写入的目录，删除脚本以免残留旧值
-        removeProfileD();
+        // 无可安全写入的目录，删除脚本以免残留旧值（不存在则跳过）
+        if (scriptExists) {
+            removeProfileDAsync(std::move(onDone));
+        } else if (onDone) {
+            onDone(true);
+        }
         return;
     }
-    installProfileD(content);
+    installProfileDAsync(content, std::move(onDone));
 }
 
 DCC_FACTORY_CLASS(EnvironmentModule)

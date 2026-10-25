@@ -47,6 +47,10 @@
         <source>Failed to update PATH</source>
         <translation>PATH 更新失败</translation>
     </message>
+    <message>
+        <source>Invalid variable name</source>
+        <translation>无效的变量名</translation>
+    </message>
 </context>
 <context>
     <name>Environment</name>
@@ -71,7 +75,7 @@
     </message>
     <message>
         <source>These variables apply only to your user account (~/.config/environment.d/dde-control-center.conf)</source>
-        <translation type="unfinished">这些变量仅适用于当前用户账户 (~/.config/environment.d/dde-control-center.conf)</translation>
+        <translation>这些变量仅适用于当前用户账户 (~/.config/environment.d/dde-control-center.conf)</translation>
     </message>
     <message>
         <source>System Variables</source>
@@ -164,6 +168,10 @@
         <translation>名称无效：必须以字母或下划线开头，只能包含字母、数字和下划线</translation>
     </message>
     <message>
+        <source>Variable value cannot contain double quotes (")</source>
+        <translation>变量值不能包含双引号 (")</translation>
+    </message>
+    <message>
         <source>Operation failed, variable may already exist</source>
         <translation>操作失败，变量可能已存在</translation>
     </message>
@@ -241,6 +249,14 @@
     <message>
         <source>Path already exists</source>
         <translation>该路径已存在</translation>
+    </message>
+    <message>
+        <source>A path entry cannot contain ':'; add one path per line</source>
+        <translation>单个路径条目不能包含 ':'，请每行填写一个路径</translation>
+    </message>
+    <message>
+        <source>A path entry cannot contain double quotes (")</source>
+        <translation>单个路径条目不能包含双引号 (")</translation>
     </message>
     <message>
         <source>No path entries</source>

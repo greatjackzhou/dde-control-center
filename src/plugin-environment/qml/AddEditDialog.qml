@@ -11,6 +11,8 @@ D.Dialog {
     property string originalKey: ""
     property string varKey: ""
     property string varValue: ""
+    // 标记本对话框已发起一次异步写操作，等待 operationResult 决定关闭或报错
+    property bool pendingOperation: false
 
     title: mode === "add" ? qsTr("New Variable") : qsTr("Edit Variable")
     width: 420
@@ -96,6 +98,9 @@ D.Dialog {
         mode = "add"
     }
 
+    // 关闭时清除发起标记，避免残留的 operationResult 误触后续关闭
+    onClosed: pendingOperation = false
+
     function doAccept() {
         var key = keyField.text.trim()
         var value = valueField.text.trim()
@@ -109,27 +114,41 @@ D.Dialog {
             errorLabel.text = qsTr("Invalid name: must start with letter or underscore, contain only letters, digits, and underscores")
             return
         }
-
-        var success = false
-        if (mode === "add") {
-            if (isSystem) {
-                success = dccData.addSystemVar(key, value)
-            } else {
-                success = dccData.addUserVar(key, value)
-            }
-        } else {
-            if (isSystem) {
-                success = dccData.editSystemVar(originalKey, key, value)
-            } else {
-                success = dccData.editUserVar(originalKey, key, value)
-            }
+        // 存储格式对含空格/冒号的值用双引号包裹且无法转义，值内出现 " 会使
+        // 写读往返与 pam_env/systemd 解析损坏，故直接拒绝
+        if (value.indexOf('"') >= 0) {
+            errorLabel.text = qsTr("Variable value cannot contain double quotes (\")")
+            return
         }
 
-        if (success) {
-            clearFields()
-            close()
+        // 发起异步操作：结果经 dccData.operationResult 回传，由下方 Connections 处理
+        pendingOperation = true
+        if (mode === "add") {
+            if (isSystem)
+                dccData.addSystemVar(key, value)
+            else
+                dccData.addUserVar(key, value)
         } else {
-            errorLabel.text = qsTr("Operation failed, variable may already exist")
+            if (isSystem)
+                dccData.editSystemVar(originalKey, key, value)
+            else
+                dccData.editUserVar(originalKey, key, value)
+        }
+    }
+
+    // 监听 C++ 异步操作结果：成功则清空并关闭，失败就地提示（弹窗不关闭，便于重试）
+    Connections {
+        target: dccData
+        function onOperationResult(success, message) {
+            if (!root.pendingOperation)
+                return
+            root.pendingOperation = false
+            if (success) {
+                root.clearFields()
+                root.close()
+            } else {
+                errorLabel.text = message
+            }
         }
     }
 
